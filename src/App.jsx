@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./supabase";
 import kalamLogo from "./assets/kalam-csc-logo.png";
 import amazonLogo from "./assets/brands/amazon.svg";
@@ -45,7 +45,7 @@ export default function App(){
  const [search,setSearch]=useState("");
  const [status,setStatus]=useState("All");
  const [brandFilter,setBrandFilter]=useState("All");
- const [sortOrder,setSortOrder]=useState("newest");
+ const [sortOrder,setSortOrder]=useState("expiry");
  const [tab,setTab]=useState("dashboard");
  const [modal,setModal]=useState(null);
  const [form,setForm]=useState({brand:"AMAZON",code:"",pin:"",amount:"",expiry:"",note:""});
@@ -56,6 +56,8 @@ export default function App(){
  const [showSecret,setShowSecret]=useState({});
  const [newBrand,setNewBrand]=useState("");
  const [editingBrand,setEditingBrand]=useState(null);
+ const lastActivityRef=useRef(Date.now());
+ const endingSessionRef=useRef(false);
 
  useEffect(()=>{
    if(!supabase){setLoading(false);return;}
@@ -76,17 +78,111 @@ export default function App(){
 
  useEffect(()=>{ if(session) loadData(); },[session]);
 
+ useEffect(()=>{
+   const userId=session?.user?.id;
+   if(!userId||!supabase)return;
+   let cancelled=false;
+   let checking=false;
+   let activeSessionEnabled=false;
+   let interval;
+   const activityEvents=["pointerdown","keydown","touchstart","wheel"];
+   const sessionKey=`kalam_active_browser_${userId}`;
+   let browserSessionId=localStorage.getItem(sessionKey);
+   if(!browserSessionId){
+     browserSessionId=crypto.randomUUID();
+     localStorage.setItem(sessionKey,browserSessionId);
+   }
+   lastActivityRef.current=Date.now();
+   endingSessionRef.current=false;
+
+   const signOutWithMessage=async reason=>{
+     if(cancelled||endingSessionRef.current)return;
+     endingSessionRef.current=true;
+     setMessage(reason);
+     const {error}=await supabase.auth.signOut({scope:"local"});
+     if(error){
+       setMessage(`${reason} Logout failed: ${error.message}`);
+       endingSessionRef.current=false;
+     }
+   };
+   const recordActivity=()=>{lastActivityRef.current=Date.now();};
+   const checkSession=async()=>{
+     if(cancelled||checking||endingSessionRef.current)return;
+     if(Date.now()-lastActivityRef.current>=60000){
+       await signOutWithMessage("1 minute inactivity ke baad aap logout ho gaye.");
+       return;
+     }
+     if(!activeSessionEnabled)return;
+     checking=true;
+     try{
+       const {data,error}=await supabase.from("active_sessions")
+         .update({last_seen_at:new Date().toISOString()})
+         .eq("user_id",userId)
+         .eq("session_id",browserSessionId)
+         .select("user_id")
+         .maybeSingle();
+       if(error){
+         activeSessionEnabled=false;
+         setMessage(`Single-browser check ruk gaya: ${error.message}. App login rahega; single-login ke liye README ka active_sessions SQL run karke refresh karein.`);
+       }else if(!data){
+         await signOutWithMessage("Aapka account kisi doosre browser/device par login hua, isliye yahan logout kar diya gaya.");
+       }
+     }catch(error){
+       activeSessionEnabled=false;
+       setMessage(`Single-browser check ruk gaya: ${error instanceof Error?error.message:String(error)}. App login rahega; active session setup karke refresh karein.`);
+     }finally{
+       checking=false;
+     }
+   };
+   const startTracking=()=>{
+     activityEvents.forEach(event=>document.addEventListener(event,recordActivity,{passive:true}));
+     interval=window.setInterval(checkSession,5000);
+   };
+   const claimSession=async()=>{
+     try{
+       const {error}=await supabase.from("active_sessions").upsert(
+         {user_id:userId,session_id:browserSessionId,last_seen_at:new Date().toISOString()},
+         {onConflict:"user_id"}
+       );
+       if(error){
+         setMessage(`Single-browser login abhi setup nahi hai: ${error.message}. App login rahega aur 1-minute inactivity logout chalta rahega. Single-login ke liye README ka active_sessions SQL run karke refresh karein.`);
+         if(!cancelled)startTracking();
+         return;
+       }
+       if(cancelled)return;
+       activeSessionEnabled=true;
+       startTracking();
+     }catch(error){
+       setMessage(`Single-browser login abhi setup nahi hai: ${error instanceof Error?error.message:String(error)}. App login rahega aur 1-minute inactivity logout chalta rahega. Active session setup karke refresh karein.`);
+       if(!cancelled)startTracking();
+     }
+   };
+   claimSession();
+   return ()=>{
+     cancelled=true;
+     window.clearInterval(interval);
+     activityEvents.forEach(event=>document.removeEventListener(event,recordActivity));
+   };
+ },[session?.user?.id]);
+
  async function loadData(){
    if(!supabase){setVouchers(demo);return;}
    try{
-     const [vr,br]=await Promise.all([
+     const [vr,br,sr]=await Promise.all([
        supabase.from("vouchers").select("*").order("created_at",{ascending:false}),
-       supabase.from("brands").select("*").eq("active",true).order("sort_order",{ascending:true})
+       supabase.from("brands").select("*").eq("active",true).order("sort_order",{ascending:true}),
+       supabase.from("security_settings").select("security_pin").maybeSingle()
      ]);
      const errors=[vr.error,br.error].filter(Boolean);
      if(errors.length) setMessage(`Data load failed: ${errors.map(error=>error.message).join("; ")}`);
      if(!vr.error) setVouchers(vr.data||[]);
      if(!br.error && br.data?.length) setBrands(br.data.map(x=>x.name));
+     if(sr.error){
+       setMessage(`Security PIN sync load nahi hua: ${sr.error.message}. Shared PIN ke liye Supabase SQL Editor me README ka “Shared security PIN” SQL run karein.`);
+     }else if(sr.data?.security_pin){
+       setSecurityPin(sr.data.security_pin);
+       localStorage.setItem("kalam_security_pin",sr.data.security_pin);
+     }
    }catch(error){
      setMessage(`Data load failed: ${error instanceof Error ? error.message : String(error)}`);
    }
@@ -212,8 +308,24 @@ export default function App(){
    }
  }
  async function saveSecurityPin(){
-   if(!/^\d{4}$/.test(securityPin)){alert("Security PIN exactly 4 digit hona chahiye.");return}
-   localStorage.setItem("kalam_security_pin",securityPin);alert("Security PIN saved.");
+   if(!/^\d{4}$/.test(securityPin)){setMessage("Security PIN exactly 4 digit hona chahiye.");return}
+   if(supabase&&!session?.user?.id){setMessage("Security PIN save karne ke liye login karein.");return}
+   setSaving(true);
+   try{
+     if(supabase){
+       const {error}=await supabase.from("security_settings").upsert(
+         {user_id:session.user.id,security_pin:securityPin},
+         {onConflict:"user_id"}
+       );
+       if(error){setMessage(`Security PIN sabhi browsers ke liye save nahi hua: ${error.message}`);return}
+     }
+     localStorage.setItem("kalam_security_pin",securityPin);
+     setMessage(supabase?"Security PIN save ho gaya. Ab isi account ke sabhi browsers par kaam karega.":"Security PIN sirf is browser me save hua; sabhi browsers ke liye Supabase configure karein.");
+   }catch(error){
+     setMessage(`Security PIN save nahi hua: ${error instanceof Error?error.message:String(error)}`);
+   }finally{
+     setSaving(false);
+   }
  }
  async function addBrand(){
    const name=newBrand.trim().toUpperCase(); if(!name)return;
@@ -227,7 +339,18 @@ export default function App(){
  }
  const current=useMemo(()=>vouchers.map(v=>isExpired(v)?{...v,status:"Expired"}:v),[vouchers]);
  const filtered=current.filter(v=>(status==="All"||v.status===status)&&(brandFilter==="All"||v.brand===brandFilter)&&(`${v.brand} ${v.code||""} ${v.pin||""} ${v.note||""} ${v.used_remark||""}`).toLowerCase().includes(search.toLowerCase()));
- const sorted=[...filtered].sort((a,b)=>sortOrder==="oldest"?new Date(a.created_at)-new Date(b.created_at):sortOrder==="amount"?Number(b.amount||0)-Number(a.amount||0):new Date(b.created_at)-new Date(a.created_at));
+ const sorted=[...filtered].sort((a,b)=>{
+   const statusOrder=(a.status==="Available"?0:1)-(b.status==="Available"?0:1);
+   if(statusOrder)return statusOrder;
+   if(sortOrder==="expiry"){
+     const aExpiry=daysUntilExpiry(a.expiry)??Infinity;
+     const bExpiry=daysUntilExpiry(b.expiry)??Infinity;
+     if(aExpiry!==bExpiry)return aExpiry-bExpiry;
+   }
+   if(sortOrder==="oldest")return new Date(a.created_at)-new Date(b.created_at);
+   if(sortOrder==="amount")return Number(b.amount||0)-Number(a.amount||0);
+   return new Date(b.created_at)-new Date(a.created_at);
+ });
  const counts=brands.map(b=>{const a=current.filter(v=>v.brand===b&&v.status==="Available");return {b,count:a.length,value:a.reduce((s,v)=>s+Number(v.amount||0),0),expiring:a.some(v=>{const days=daysUntilExpiry(v.expiry);return days!==null&&days>=0&&days<=30})}});
  const totalAmount=current.reduce((sum,v)=>sum+Number(v.amount||0),0);
  if(loading)return <div className="center">Loading…</div>;
@@ -237,9 +360,9 @@ export default function App(){
  return <div className="app">
    <header className="appHeader"><div className="headerLogo"><img src={kalamLogo} alt="Kalam CSC Center logo"/></div><div className="headerTitle"><h1><span>KALAM VOUCHER</span><span>MANAGER</span></h1><p>Secure voucher storage</p></div><div className="headerActions"><button onClick={()=>setTab(tab==="settings"?"dashboard":"settings")}>{tab==="settings"?"▦ Dashboard":"⚙ Settings"}</button><button className="primary" onClick={openAdd}>＋ Add Voucher</button>{supabase&&<button onClick={logout}>Logout</button>}</div></header>
    {message&&<div className="notice">{message}</div>}
-   {tab==="settings"?<Settings brands={brands} newBrand={newBrand} setNewBrand={setNewBrand} addBrand={addBrand} renameBrand={renameBrand} securityPin={securityPin} setSecurityPin={setSecurityPin} saveSecurityPin={saveSecurityPin} email={session?.user?.email||""} onForgot={()=>setLoginMode("forgot")}/>:<>
+   {tab==="settings"?<Settings brands={brands} newBrand={newBrand} setNewBrand={setNewBrand} addBrand={addBrand} renameBrand={renameBrand} securityPin={securityPin} setSecurityPin={setSecurityPin} saveSecurityPin={saveSecurityPin} saving={saving} email={session?.user?.email||""} onForgot={()=>setLoginMode("forgot")}/>:<>
    <section className="brandGrid">{counts.map((c,index)=><button className={`brandCard brandCard-${index%8}`} key={c.b} onClick={()=>{setBrandFilter(c.b);window.scrollTo({top:350,behavior:"smooth"})}}><BrandLogo brand={c.b} className="brandIcon"/><span className="brandInfo"><strong>{c.b}</strong><span>{c.count} Available</span><b>₹{c.value.toLocaleString("en-IN")}</b></span><span className="brandTotal">▣</span>{c.expiring&&<span className="expiryDot" role="img" aria-label={`${c.b} has a voucher expiring within 30 days`} title="Voucher expiring within 30 days"/>}</button>)}</section>
-   <section className="panel voucherPanel"><div className="voucherListHeader"><h2><span className="listIcon">▤</span>Voucher List</h2><div className="totals"><span>Total Vouchers: <b>{current.length}</b></span><i/><span>Total Amount: <b>₹{totalAmount.toLocaleString("en-IN")}</b></span></div></div><div className="filters"><input type="search" name="voucher-search" autoComplete="off" placeholder="⌕  Search brand, code, note, PIN…" value={search} onChange={e=>setSearch(e.target.value)}/><select value={brandFilter} onChange={e=>setBrandFilter(e.target.value)}><option value="All">All Brands</option>{brands.map(b=><option key={b}>{b}</option>)}</select><select value={status} onChange={e=>setStatus(e.target.value)}><option value="All">All Status</option><option>Available</option><option>Used</option><option>Expired</option></select><select value={sortOrder} onChange={e=>setSortOrder(e.target.value)}><option value="newest">▦ Newest First</option><option value="oldest">Oldest First</option><option value="amount">Amount: High to Low</option></select></div>
+   <section className="panel voucherPanel"><div className="voucherListHeader"><h2><span className="listIcon">▤</span>Voucher List</h2><div className="totals"><span>Total Vouchers: <b>{current.length}</b></span><i/><span>Total Amount: <b>₹{totalAmount.toLocaleString("en-IN")}</b></span></div></div><div className="filters"><input type="search" name="voucher-search" autoComplete="off" placeholder="⌕  Search brand, code, note, PIN…" value={search} onChange={e=>setSearch(e.target.value)}/><select value={brandFilter} onChange={e=>setBrandFilter(e.target.value)}><option value="All">All Brands</option>{brands.map(b=><option key={b}>{b}</option>)}</select><select value={status} onChange={e=>setStatus(e.target.value)}><option value="All">All Status</option><option>Available</option><option>Used</option><option>Expired</option></select><select value={sortOrder} onChange={e=>setSortOrder(e.target.value)}><option value="expiry">⌛ Expiry: Soonest First</option><option value="newest">▦ Newest First</option><option value="oldest">Oldest First</option><option value="amount">Amount: High to Low</option></select></div>
    <div className="tableWrap"><table><thead><tr><th>#</th><th>Brand</th><th>Voucher Code</th><th>PIN</th><th>Amount</th><th>Expiry Date</th><th>Note</th><th>Status</th><th>Used Date/Time & Remark</th><th>Action</th></tr></thead><tbody>{sorted.map((v,index)=><VoucherRow key={v.id} v={v} index={index+1} revealed={showSecret} reveal={reveal} requestAction={requestAction}/>)}</tbody></table>{!sorted.length&&<div className="emptyList">No vouchers match your filters.</div>}</div></section>
    </>}
    {modal?.type==="voucher"&&<VoucherModal form={form} setForm={setForm} close={()=>{setSaveError("");setModal(null);}} save={saveVoucher} edit={!!modal.edit} brands={brands} error={saveError} saving={saving}/>}
@@ -251,9 +374,9 @@ export default function App(){
 function BrandLogo({brand,className}){const logo=BRAND_LOGOS[brand];return <span className={`${className} brandLogo${brand==="OTHER"?" otherLogo":""}`} aria-label={`${brand} logo`}>{logo?<img src={logo} alt=""/>:<span className="otherDots"><i/><i/><i/><i/></span>}</span>}
 function Login(p){return <div className="login"><div className="loginBox"><h1>KALAM VOUCHER MANAGER</h1><p>Secure Login</p>{p.loginMode==="forgot"?<><input placeholder="Registered Email" value={p.email} onChange={e=>p.setEmail(e.target.value)}/><button className="primary" onClick={p.auth}>Send Reset Link</button><button onClick={()=>p.setLoginMode("login")}>Back to Login</button></>:<><input type="email" placeholder="Email" value={p.email} onChange={e=>p.setEmail(e.target.value)}/><input type="password" placeholder="Password" value={p.password} onChange={e=>p.setPassword(e.target.value)}/><button className="primary" onClick={p.auth}>Login</button><button onClick={()=>p.setLoginMode("forgot")}>Forgot Password?</button></>}{p.message&&<div className="notice">{p.message}</div>}</div></div>}
 function VoucherRow({v,index,revealed,reveal,requestAction}){
- const light=v.status==="Used"?"usedRow":v.status==="Expired"?"expiredRow":"";
  const daysLeft=daysUntilExpiry(v.expiry);
- return <tr className={light}><td className="rowNumber">{index}</td><td><div className="tableBrand"><BrandLogo brand={v.brand} className="tableBrandIcon"/><b>{v.brand}</b></div></td><td><span className="secretReveal"><b className="voucherCode">{revealed[v.id+"code"]?v.code:maskCode(v.code)}</b></span><div className="tiny">{fmtDate(v.created_at)}</div>{v.code&&<button className="eye secretReveal" onClick={()=>reveal(v,"code")}>👁</button>}</td><td>{v.pin?<><span className="secret secretReveal">{revealed[v.id+"pin"]?v.pin:"••••"}</span><button className="eye secretReveal" onClick={()=>reveal(v,"pin")}>👁</button></>:<span className="muted">—</span>}</td><td className="amountCell">₹{Number(v.amount||0).toLocaleString("en-IN")}</td><td><span className="expiryCell"><span className="expiryTag">{fmtDate(v.expiry)}</span>{daysLeft!==null&&daysLeft<0&&<span className="expiryAlert expired">Expired</span>}{daysLeft!==null&&daysLeft>=0&&daysLeft<=30&&<span className="expiryAlert">{daysLeft===0?"Expires Today":`${daysLeft} ${daysLeft===1?"Day":"Days"} Left`}</span>}</span></td><td>{v.note||"—"}</td><td><span className={"badge "+v.status.toLowerCase()}><i/> {v.status}</span></td><td>{fmtDateTime(v.used_at)}{v.used_remark&&<div className="usedRemark">{v.used_remark}</div>}</td><td className="actions">{v.status==="Available"&&<button className="green" onClick={()=>requestAction(v,"markUsed")}>✓ Used</button>}<button className="blue" onClick={()=>requestAction(v,"edit")}>✏ Edit</button><button className="red" onClick={()=>requestAction(v,"delete")}>▤</button></td></tr>
+ const rowClass=v.status==="Used"?"usedRow":v.status==="Expired"?"expiredRow":v.status==="Available"&&daysLeft!==null&&daysLeft>=0&&daysLeft<=3?"urgentExpiry":"";
+ return <tr className={rowClass}><td className="rowNumber">{index}</td><td><div className="tableBrand"><BrandLogo brand={v.brand} className="tableBrandIcon"/><b>{v.brand}</b></div></td><td><span className="secretReveal"><b className="voucherCode">{revealed[v.id+"code"]?v.code:maskCode(v.code)}</b></span><div className="tiny">{fmtDate(v.created_at)}</div>{v.code&&<button className="eye secretReveal" onClick={()=>reveal(v,"code")}>👁</button>}</td><td>{v.pin?<><span className="secret secretReveal">{revealed[v.id+"pin"]?v.pin:"••••"}</span><button className="eye secretReveal" onClick={()=>reveal(v,"pin")}>👁</button></>:<span className="muted">—</span>}</td><td className="amountCell">₹{Number(v.amount||0).toLocaleString("en-IN")}</td><td><span className="expiryCell"><span className="expiryTag">{fmtDate(v.expiry)}</span>{daysLeft!==null&&daysLeft<0&&<span className="expiryAlert expired">Expired</span>}{daysLeft!==null&&daysLeft>=0&&daysLeft<=30&&<span className="expiryAlert">{daysLeft===0?"Expires Today":`${daysLeft} ${daysLeft===1?"Day":"Days"} Left`}</span>}</span></td><td>{v.note||"—"}</td><td><span className={"badge "+v.status.toLowerCase()}><i/> {v.status}</span></td><td>{fmtDateTime(v.used_at)}{v.used_remark&&<div className="usedRemark">{v.used_remark}</div>}</td><td className="actions">{v.status==="Available"&&<button className="green" onClick={()=>requestAction(v,"markUsed")}>✓ Used</button>}<button className="blue" onClick={()=>requestAction(v,"edit")}>✏ Edit</button><button className="red" onClick={()=>requestAction(v,"delete")}>▤</button></td></tr>
 }
 function UsedRemarkModal({modal,setModal,close,save,error,saving}){
  return <div className="overlay"><div className="modal">
@@ -275,4 +398,4 @@ function VoucherModal({form,setForm,close,save,edit,brands,error,saving}){
  <label>Note{F("note",{placeholder:"Optional note"})}</label>
  {error&&<div className="notice" role="alert">{error}</div>}
  <div className="modalActions"><button onClick={close} disabled={saving}>Cancel</button><button className="primary" onClick={save} disabled={saving}>{saving?"Saving…":"Save"}</button></div></div></div>}
-function Settings({brands,newBrand,setNewBrand,addBrand,renameBrand,securityPin,setSecurityPin,saveSecurityPin,email,onForgot}){return <section className="settings panel"><h2>⚙ Settings</h2><div className="settingBox"><h3>Security PIN</h3><p>4-digit PIN used to reveal voucher Code/PIN.</p><input type="password" maxLength="4" value={securityPin} onChange={e=>setSecurityPin(e.target.value.replace(/\D/g,"").slice(0,4))}/><button className="primary" onClick={saveSecurityPin}>Save Security PIN</button></div><div className="settingBox"><h3>Recovery</h3><p>Registered email: <b>{email||"Supabase account email"}</b></p><button onClick={onForgot}>Forgot Password / Reset</button></div><div className="settingBox"><h3>Manage Brands</h3><div className="brandAdd"><input placeholder="New brand name" value={newBrand} onChange={e=>setNewBrand(e.target.value)}/><button className="primary" onClick={addBrand}>＋ Add Brand</button></div>{brands.map(b=><div className="brandManage" key={b}><span>{b}</span><button className="blue" onClick={()=>renameBrand(b)}>✏ Rename</button></div>)}</div></section>}
+function Settings({brands,newBrand,setNewBrand,addBrand,renameBrand,securityPin,setSecurityPin,saveSecurityPin,saving,email,onForgot}){return <section className="settings panel"><h2>⚙ Settings</h2><div className="settingBox"><h3>Security PIN</h3><p>4-digit PIN used to reveal voucher Code/PIN.</p><input type="password" maxLength="4" value={securityPin} onChange={e=>setSecurityPin(e.target.value.replace(/\D/g,"").slice(0,4))}/><button className="primary" onClick={saveSecurityPin} disabled={saving}>{saving?"Saving…":"Save Security PIN"}</button></div><div className="settingBox"><h3>Recovery</h3><p>Registered email: <b>{email||"Supabase account email"}</b></p><button onClick={onForgot}>Forgot Password / Reset</button></div><div className="settingBox"><h3>Manage Brands</h3><div className="brandAdd"><input placeholder="New brand name" value={newBrand} onChange={e=>setNewBrand(e.target.value)}/><button className="primary" onClick={addBrand}>＋ Add Brand</button></div>{brands.map(b=><div className="brandManage" key={b}><span>{b}</span><button className="blue" onClick={()=>renameBrand(b)}>✏ Rename</button></div>)}</div></section>}

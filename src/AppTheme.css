@@ -429,6 +429,20 @@
   animation: expiry-blink 1.2s ease-in-out infinite;
 }
 
+.urgentExpiry td {
+  background: #fff0ef;
+}
+
+.usedRow td {
+  background: #f0f3f8;
+  color: #64748b;
+}
+
+.expiredRow td {
+  background: #fff5ec;
+  color: #806b5a;
+}
+
 .expiryAlert.expired {
   border-color: #e88791;
   background: #ffd9dd;
