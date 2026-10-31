@@ -22,8 +22,11 @@ create table if not exists public.vouchers (
   note text,
   status text not null default 'Available' check(status in ('Available','Used','Expired')),
   created_at timestamptz not null default now(),
-  used_at timestamptz
+  used_at timestamptz,
+  used_remark text
 );
+
+alter table public.vouchers add column if not exists used_remark text;
 
 alter table public.brands enable row level security;
 alter table public.vouchers enable row level security;

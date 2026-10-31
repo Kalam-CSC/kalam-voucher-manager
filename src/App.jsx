@@ -66,7 +66,10 @@ export default function App(){
 
  useEffect(()=>{
    if(!Object.values(showSecret).some(Boolean))return;
-   const hideSecrets=()=>setShowSecret({});
+   const hideSecrets=event=>{
+     if(event.target.closest?.(".secretReveal"))return;
+     setShowSecret({});
+   };
    document.addEventListener("pointerdown",hideSecrets);
    return ()=>document.removeEventListener("pointerdown",hideSecrets);
  },[showSecret]);
@@ -153,16 +156,31 @@ export default function App(){
      setSaving(false);
    }
  }
- async function markUsed(v){
-   if(!confirm("Kya ye voucher use ho chuka hai?"))return;
-   const patch={status:"Used",used_at:new Date().toISOString()};
-   if(supabase){const {data,error}=await supabase.from("vouchers").update(patch).eq("id",v.id).select().single();if(error){setMessage(error.message);return}setVouchers(x=>x.map(a=>a.id===v.id?data:a));}
-   else setVouchers(x=>x.map(a=>a.id===v.id?{...a,...patch}:a));
- }
- async function markAvailable(v){
-   const patch={status:"Available",used_at:null};
-   if(supabase){const {data,error}=await supabase.from("vouchers").update(patch).eq("id",v.id).select().single();if(error){setMessage(error.message);return}setVouchers(x=>x.map(a=>a.id===v.id?data:a));}
-   else setVouchers(x=>x.map(a=>a.id===v.id?{...a,...patch}:a));
+ async function saveUsedRemark(){
+   if(modal?.type!=="usedRemark"||modal.voucher.status!=="Available")return;
+   const patch={status:"Used",used_at:new Date().toISOString(),used_remark:modal.remark.trim()||null};
+   setSaveError("");
+   setSaving(true);
+   try{
+     if(supabase){
+       const {data,error}=await supabase.from("vouchers").update(patch).eq("id",modal.voucher.id).eq("status","Available").select().maybeSingle();
+       if(error){setSaveError(`Voucher use save nahi hua: ${error.message}`);return;}
+       if(!data){
+         setMessage("Ye voucher pehle hi use mark ho chuka hai.");
+         setModal(null);
+         await loadData();
+         return;
+       }
+       setVouchers(x=>x.map(v=>v.id===modal.voucher.id?data:v));
+     }else{
+       setVouchers(x=>x.map(v=>v.id===modal.voucher.id?{...v,...patch}:v));
+     }
+     setModal(null);
+   }catch(error){
+     setSaveError(`Voucher use save nahi hua: ${error instanceof Error ? error.message : String(error)}`);
+   }finally{
+     setSaving(false);
+   }
  }
  async function deleteVoucher(v){
    if(!confirm("Voucher permanently delete karein?"))return;
@@ -174,6 +192,7 @@ export default function App(){
    setVerify({type:"reveal",v,field});
  }
  function requestAction(v,action){
+   if(action==="markUsed"&&v.status!=="Available")return;
    setVerify({type:"action",v,action});
  }
  async function verifySecurityPin(){
@@ -187,8 +206,10 @@ export default function App(){
    }
    if(request.action==="edit")openEdit(request.v);
    if(request.action==="delete")await deleteVoucher(request.v);
-   if(request.action==="markUsed")await markUsed(request.v);
-   if(request.action==="markAvailable")await markAvailable(request.v);
+   if(request.action==="markUsed"&&request.v.status==="Available"){
+     setSaveError("");
+     setModal({type:"usedRemark",voucher:request.v,remark:""});
+   }
  }
  async function saveSecurityPin(){
    if(!/^\d{4}$/.test(securityPin)){alert("Security PIN exactly 4 digit hona chahiye.");return}
@@ -205,7 +226,7 @@ export default function App(){
    setBrands(x=>x.map(b=>b===oldName?name:b));setVouchers(x=>x.map(v=>v.brand===oldName?{...v,brand:name}:v));
  }
  const current=useMemo(()=>vouchers.map(v=>isExpired(v)?{...v,status:"Expired"}:v),[vouchers]);
- const filtered=current.filter(v=>(status==="All"||v.status===status)&&(brandFilter==="All"||v.brand===brandFilter)&&(`${v.brand} ${v.code||""} ${v.pin||""} ${v.note||""}`).toLowerCase().includes(search.toLowerCase()));
+ const filtered=current.filter(v=>(status==="All"||v.status===status)&&(brandFilter==="All"||v.brand===brandFilter)&&(`${v.brand} ${v.code||""} ${v.pin||""} ${v.note||""} ${v.used_remark||""}`).toLowerCase().includes(search.toLowerCase()));
  const sorted=[...filtered].sort((a,b)=>sortOrder==="oldest"?new Date(a.created_at)-new Date(b.created_at):sortOrder==="amount"?Number(b.amount||0)-Number(a.amount||0):new Date(b.created_at)-new Date(a.created_at));
  const counts=brands.map(b=>{const a=current.filter(v=>v.brand===b&&v.status==="Available");return {b,count:a.length,value:a.reduce((s,v)=>s+Number(v.amount||0),0),expiring:a.some(v=>{const days=daysUntilExpiry(v.expiry);return days!==null&&days>=0&&days<=30})}});
  const totalAmount=current.reduce((sum,v)=>sum+Number(v.amount||0),0);
@@ -219,9 +240,10 @@ export default function App(){
    {tab==="settings"?<Settings brands={brands} newBrand={newBrand} setNewBrand={setNewBrand} addBrand={addBrand} renameBrand={renameBrand} securityPin={securityPin} setSecurityPin={setSecurityPin} saveSecurityPin={saveSecurityPin} email={session?.user?.email||""} onForgot={()=>setLoginMode("forgot")}/>:<>
    <section className="brandGrid">{counts.map((c,index)=><button className={`brandCard brandCard-${index%8}`} key={c.b} onClick={()=>{setBrandFilter(c.b);window.scrollTo({top:350,behavior:"smooth"})}}><BrandLogo brand={c.b} className="brandIcon"/><span className="brandInfo"><strong>{c.b}</strong><span>{c.count} Available</span><b>₹{c.value.toLocaleString("en-IN")}</b></span><span className="brandTotal">▣</span>{c.expiring&&<span className="expiryDot" role="img" aria-label={`${c.b} has a voucher expiring within 30 days`} title="Voucher expiring within 30 days"/>}</button>)}</section>
    <section className="panel voucherPanel"><div className="voucherListHeader"><h2><span className="listIcon">▤</span>Voucher List</h2><div className="totals"><span>Total Vouchers: <b>{current.length}</b></span><i/><span>Total Amount: <b>₹{totalAmount.toLocaleString("en-IN")}</b></span></div></div><div className="filters"><input type="search" name="voucher-search" autoComplete="off" placeholder="⌕  Search brand, code, note, PIN…" value={search} onChange={e=>setSearch(e.target.value)}/><select value={brandFilter} onChange={e=>setBrandFilter(e.target.value)}><option value="All">All Brands</option>{brands.map(b=><option key={b}>{b}</option>)}</select><select value={status} onChange={e=>setStatus(e.target.value)}><option value="All">All Status</option><option>Available</option><option>Used</option><option>Expired</option></select><select value={sortOrder} onChange={e=>setSortOrder(e.target.value)}><option value="newest">▦ Newest First</option><option value="oldest">Oldest First</option><option value="amount">Amount: High to Low</option></select></div>
-   <div className="tableWrap"><table><thead><tr><th>#</th><th>Brand</th><th>Voucher Code</th><th>PIN</th><th>Amount</th><th>Expiry Date</th><th>Note</th><th>Status</th><th>Used Date/Time</th><th>Action</th></tr></thead><tbody>{sorted.map((v,index)=><VoucherRow key={v.id} v={v} index={index+1} revealed={showSecret} reveal={reveal} requestAction={requestAction}/>)}</tbody></table>{!sorted.length&&<div className="emptyList">No vouchers match your filters.</div>}</div></section>
+   <div className="tableWrap"><table><thead><tr><th>#</th><th>Brand</th><th>Voucher Code</th><th>PIN</th><th>Amount</th><th>Expiry Date</th><th>Note</th><th>Status</th><th>Used Date/Time & Remark</th><th>Action</th></tr></thead><tbody>{sorted.map((v,index)=><VoucherRow key={v.id} v={v} index={index+1} revealed={showSecret} reveal={reveal} requestAction={requestAction}/>)}</tbody></table>{!sorted.length&&<div className="emptyList">No vouchers match your filters.</div>}</div></section>
    </>}
    {modal?.type==="voucher"&&<VoucherModal form={form} setForm={setForm} close={()=>{setSaveError("");setModal(null);}} save={saveVoucher} edit={!!modal.edit} brands={brands} error={saveError} saving={saving}/>}
+   {modal?.type==="usedRemark"&&<UsedRemarkModal modal={modal} setModal={setModal} close={()=>{setSaveError("");setModal(null);}} save={saveUsedRemark} error={saveError} saving={saving}/>}
    {verify&&<div className="overlay"><div className="modal"><h3>Security PIN</h3><p>{verify.type==="reveal"?"Voucher secret dekhne ke liye":"Is action ko continue karne ke liye"} 4-digit Security PIN enter karein.</p><input autoFocus type="password" name="security-verification-pin" autoComplete="new-password" inputMode="numeric" maxLength="4" id="securityVerify" placeholder="••••"/><div className="modalActions"><button onClick={()=>setVerify(null)}>Cancel</button><button className="primary" onClick={verifySecurityPin}>Verify</button></div></div></div>}
  </div>
 }
@@ -231,7 +253,16 @@ function Login(p){return <div className="login"><div className="loginBox"><h1>KA
 function VoucherRow({v,index,revealed,reveal,requestAction}){
  const light=v.status==="Used"?"usedRow":v.status==="Expired"?"expiredRow":"";
  const daysLeft=daysUntilExpiry(v.expiry);
- return <tr className={light}><td className="rowNumber">{index}</td><td><div className="tableBrand"><BrandLogo brand={v.brand} className="tableBrandIcon"/><b>{v.brand}</b></div></td><td><b className="voucherCode">{revealed[v.id+"code"]?v.code:maskCode(v.code)}</b><div className="tiny">{fmtDate(v.created_at)}</div>{v.code&&<button className="eye" onClick={()=>reveal(v,"code")}>👁</button>}</td><td>{v.pin?<><span className="secret">{revealed[v.id+"pin"]?v.pin:"••••"}</span><button className="eye" onClick={()=>reveal(v,"pin")}>👁</button></>:<span className="muted">—</span>}</td><td className="amountCell">₹{Number(v.amount||0).toLocaleString("en-IN")}</td><td><span className="expiryCell"><span className="expiryTag">{fmtDate(v.expiry)}</span>{daysLeft!==null&&daysLeft<0&&<span className="expiryAlert expired">Expired</span>}{daysLeft!==null&&daysLeft>=0&&daysLeft<=30&&<span className="expiryAlert">{daysLeft===0?"Expires Today":`${daysLeft} ${daysLeft===1?"Day":"Days"} Left`}</span>}</span></td><td>{v.note||"—"}</td><td><span className={"badge "+v.status.toLowerCase()}><i/> {v.status}</span></td><td>{fmtDateTime(v.used_at)}</td><td className="actions">{v.status==="Available"&&<button className="green" onClick={()=>requestAction(v,"markUsed")}>✓ Used</button>}{v.status==="Used"&&<button onClick={()=>requestAction(v,"markAvailable")}>↩ Available</button>}<button className="blue" onClick={()=>requestAction(v,"edit")}>✏ Edit</button><button className="red" onClick={()=>requestAction(v,"delete")}>▤</button></td></tr>
+ return <tr className={light}><td className="rowNumber">{index}</td><td><div className="tableBrand"><BrandLogo brand={v.brand} className="tableBrandIcon"/><b>{v.brand}</b></div></td><td><span className="secretReveal"><b className="voucherCode">{revealed[v.id+"code"]?v.code:maskCode(v.code)}</b></span><div className="tiny">{fmtDate(v.created_at)}</div>{v.code&&<button className="eye secretReveal" onClick={()=>reveal(v,"code")}>👁</button>}</td><td>{v.pin?<><span className="secret secretReveal">{revealed[v.id+"pin"]?v.pin:"••••"}</span><button className="eye secretReveal" onClick={()=>reveal(v,"pin")}>👁</button></>:<span className="muted">—</span>}</td><td className="amountCell">₹{Number(v.amount||0).toLocaleString("en-IN")}</td><td><span className="expiryCell"><span className="expiryTag">{fmtDate(v.expiry)}</span>{daysLeft!==null&&daysLeft<0&&<span className="expiryAlert expired">Expired</span>}{daysLeft!==null&&daysLeft>=0&&daysLeft<=30&&<span className="expiryAlert">{daysLeft===0?"Expires Today":`${daysLeft} ${daysLeft===1?"Day":"Days"} Left`}</span>}</span></td><td>{v.note||"—"}</td><td><span className={"badge "+v.status.toLowerCase()}><i/> {v.status}</span></td><td>{fmtDateTime(v.used_at)}{v.used_remark&&<div className="usedRemark">{v.used_remark}</div>}</td><td className="actions">{v.status==="Available"&&<button className="green" onClick={()=>requestAction(v,"markUsed")}>✓ Used</button>}<button className="blue" onClick={()=>requestAction(v,"edit")}>✏ Edit</button><button className="red" onClick={()=>requestAction(v,"delete")}>▤</button></td></tr>
+}
+function UsedRemarkModal({modal,setModal,close,save,error,saving}){
+ return <div className="overlay"><div className="modal">
+   <h2>Voucher Used</h2>
+   <p>Jahan voucher use hua, uska remark likhein.</p>
+   <label>Used At / Remark<textarea autoFocus rows="3" maxLength="500" placeholder="Jaise: Amazon order #1234" value={modal.remark} onChange={e=>setModal({...modal,remark:e.target.value})}/></label>
+   {error&&<div className="notice">{error}</div>}
+   <div className="modalActions"><button onClick={close} disabled={saving}>Cancel</button><button className="primary" onClick={save} disabled={saving}>{saving?"Saving…":"Mark as Used"}</button></div>
+ </div></div>
 }
 function VoucherModal({form,setForm,close,save,edit,brands,error,saving}){
  const F=(k,props={})=>{const {digitsOnly,...inputProps}=props;return <input value={form[k]} {...inputProps} onChange={e=>setForm({...form,[k]:digitsOnly?e.target.value.replace(/\D/g,""):e.target.value})}/>};

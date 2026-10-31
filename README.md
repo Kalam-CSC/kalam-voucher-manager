@@ -37,3 +37,13 @@ drop policy if exists "kalam require active auth session" on public.vouchers;
 ```
 
 The app's `"authenticated can insert own vouchers"` policy still requires a signed-in user and restricts inserts to that user's own rows. This removes only the conflicting policy and does not delete voucher data. Sign out and back in to the app after running it.
+
+## Save used-voucher remarks
+
+Used vouchers can store a remark describing where they were used. If your Supabase database was created before this field was added, run this once in Supabase Dashboard → SQL Editor:
+
+```sql
+alter table public.vouchers add column if not exists used_remark text;
+```
+
+Once a voucher is marked Used, the dashboard does not allow changing it back to Available.
